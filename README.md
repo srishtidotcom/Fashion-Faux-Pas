@@ -77,42 +77,6 @@ Grounded detection (GroundingDINO / OWL-ViT) is the structurally "most correct" 
 
 ---
 
-## Repository structure
-
-```
-Fashion-Faux-Pas/
-├── data/
-│   ├── raw/                        # source images
-│   ├── processed/
-│   │   ├── captions.json           # Florence-2 output, keyed by filename
-│   │   ├── attributes.json         # LLM-parsed {scene, style, pose, garments[]} per image
-│   │   ├── documents.json          # caption + attributes + filename merged into one indexable record
-│   │   ├── embeddings.npy          # FashionCLIP image vectors
-│   │   ├── embedding_metadata.json # embedding <-> filename/index mapping
-│   │   └── filenames.json          # ordering reference for embeddings.npy
-│   ├── qdrant_db/                  # live Qdrant local storage (collection: fashion_images)
-│   ├── qdrant_db_sanity/           # scratch collection for sanity checks
-│   └── qdrant_db_test_probe/       # scratch collection for probing/debugging
-├── indexing/
-│   ├── caption_images.py           # Florence-2 → data/processed/captions.json
-│   ├── parse_caption.py            # LLM, schema-constrained → data/processed/attributes.json
-│   ├── build_document.py           # merges caption + attributes + filename → documents.json
-│   ├── extract_embeddings.py       # FashionCLIP, batch → embeddings.npy + embedding_metadata.json
-│   ├── extract_embedding.py        # single-image variant (debugging/ad hoc use)
-│   └── index_qdrant.py             # upserts vectors + document payload into Qdrant
-├── retrieval/                       # query parsing, ANN recall, hybrid rerank — in progress
-├── scripts/
-│   └── rename_images.py            # normalizes raw filenames (e.g. 000001.jpg) before indexing
-├── configs/                         # reserved for model/α-β/Qdrant connection config — not yet populated
-└── requirements.txt
-```
-
-Indexing is fully wired end to end: `caption_images.py → parse_caption.py → build_document.py → extract_embeddings.py → index_qdrant.py`, each stage reading the previous stage's output from `data/processed/`. `retrieval/` and `configs/` are scaffolded directories — the query-side pipeline (query parsing, ANN recall, hybrid α/β rerank) is the active work-in-progress; commands below reflect the current indexing pipeline and the intended retrieval interface.
-
-The three `qdrant_db*` directories aren't redundant: `qdrant_db` is the real collection built from `data/processed/`, while `qdrant_db_sanity` and `qdrant_db_test_probe` are disposable scratch collections for validating the indexing/search logic without touching the real index. Worth `.gitignore`-ing all three (or at least the two scratch ones) rather than committing local Qdrant storage.
-
----
-
 ## Setup
 
 ```bash
@@ -216,7 +180,3 @@ The α/β blend isn't only a precision knob — when `attribute_overlap` is near
 - Use parser/embedding disagreement as a trigger to route the disputed subset through grounded detection (Approach D) as a Phase 2 attribute source — keeping the expensive detector off the common case.
 
 ---
-
-## License
-
-MIT (or update to match your submission requirements).
