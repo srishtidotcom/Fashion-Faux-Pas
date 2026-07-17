@@ -1,0 +1,12 @@
+{
+  "model": "patrickjohncyh/fashion-clip",
+  "embedding_dimension": 512,
+  "normalized": true,
+  "dtype": "float32",
+  "num_images": 512,
+  "output_shape": [
+    512,
+    512
+  ],
+  "device_used": "cuda"
+}
