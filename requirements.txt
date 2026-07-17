@@ -1,0 +1,5 @@
+requests
+Pillow
+transformers>=4.42.0
+torch
+tqdm
