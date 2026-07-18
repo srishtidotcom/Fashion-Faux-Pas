@@ -9,7 +9,6 @@ perform reranking, query parsing, or evaluation.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
@@ -23,11 +22,11 @@ from qdrant_client.http import models
 from transformers import AutoModel, AutoProcessor
 
 try:
-	from retrieval.parse_query import QueryDocument, normalize_query
+	from retrieval.parse_query import QueryDocument, parse_query
 except (ModuleNotFoundError, ImportError):  # pragma: no cover
 	# When executed as `python retrieval/retrieve.py`, the parent package is not
 	# installed, so fall back to a sibling-module import from the same directory.
-	from parse_query import QueryDocument, normalize_query
+	from parse_query import QueryDocument, parse_query
 
 # -----------------------------
 # Configuration
@@ -36,6 +35,7 @@ DEFAULT_MODEL_NAME = "patrickjohncyh/fashion-clip"
 DEFAULT_QDRANT_PATH = Path("data/qdrant_db")
 DEFAULT_COLLECTION_NAME = "fashion_images"
 DEFAULT_TOP_K = 100
+DEFAULT_DISPLAY_TOP_K = 10
 
 
 @dataclass(slots=True)
@@ -53,6 +53,9 @@ class RetrievedCandidate:
 	garments: List[Dict[str, Any]]
 	vector_score: float
 	payload: Dict[str, Any]
+	attribute_score: float = 0.0
+	final_score: float = 0.0
+	score_breakdown: Optional[Dict[str, float]] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,6 +155,14 @@ def load_qdrant(qdrant_path: Path = DEFAULT_QDRANT_PATH) -> QdrantClient:
 	return _load_qdrant_cached(str(qdrant_path))
 
 
+def close_qdrant(qdrant_path: Path = DEFAULT_QDRANT_PATH) -> None:
+	"""Close the cached local Qdrant client and clear the cache."""
+	if _load_qdrant_cached.cache_info().currsize > 0:
+		client = _load_qdrant_cached(str(qdrant_path))
+		client.close()
+	_load_qdrant_cached.cache_clear()
+
+
 def embed_query(processor: Any, model: Any, device: torch.device, embedding_text: str) -> np.ndarray:
 	"""Embed the query text with FashionCLIP and L2-normalize the result."""
 	logging.info("Embedding query...")
@@ -197,17 +208,21 @@ def search_qdrant(
 def convert_hit(hit: models.ScoredPoint) -> RetrievedCandidate:
 	"""Convert a Qdrant scored point into a typed retrieval candidate."""
 	payload = dict(hit.payload or {})
+	vector_score = float(hit.score)
 	return RetrievedCandidate(
 		id=int(hit.id),
 		filename=str(payload.get("filename", "")),
-		score=float(hit.score),
+		score=vector_score,
 		caption=str(payload.get("caption", "")),
 		scene=payload.get("scene"),
 		style=payload.get("style"),
 		pose=payload.get("pose"),
 		objects=list(payload.get("objects", [])) if isinstance(payload.get("objects"), list) else [],
 		garments=list(payload.get("garments", [])) if isinstance(payload.get("garments"), list) else [],
-		vector_score=float(hit.score),
+		vector_score=vector_score,
+		attribute_score=0.0,
+		final_score=vector_score,
+		score_breakdown=None,
 		payload=payload,
 	)
 
@@ -240,47 +255,15 @@ def retrieve(
 		return []
 
 
-def _prompt_query() -> str:
-	"""Read a raw query from stdin."""
-	try:
-		return input("Enter query: ")
-	except EOFError:
-		return ""
-
-
-def main() -> None:
-	"""Prompt for a query, run semantic retrieval, and print the top results."""
-	setup_logging()
-	args = parse_args()
-
-	raw_query = args.query if args.query is not None else _prompt_query()
-	normalized_query = normalize_query(raw_query)
-	query_document = QueryDocument(
-		raw_query=raw_query,
-		scene=None,
-		style=None,
-		pose=None,
-		objects=[],
-		garments=[],
-		embedding_text=normalized_query,
-	)
-
-	candidates = retrieve(
-		query_document=query_document,
-		top_k=args.top_k,
-		model_name=args.model_name,
-		qdrant_path=args.qdrant_path,
-		collection_name=args.collection_name,
-		device=args.device,
-	)
-
-	if not candidates:
+def display_candidates(candidates: Sequence[RetrievedCandidate], top_n: int = DEFAULT_DISPLAY_TOP_K) -> None:
+	"""Pretty-print the top semantic candidates for debugging and CLI use."""
+	visible_candidates = list(candidates[:top_n])
+	if not visible_candidates:
 		print("No results found.")
-		logging.info("Done.")
 		return
 
 	print("======================================================")
-	for rank, candidate in enumerate(candidates, start=1):
+	for rank, candidate in enumerate(visible_candidates, start=1):
 		print(f"Rank {rank}")
 		print()
 		print("Filename")
@@ -297,10 +280,47 @@ def main() -> None:
 		print()
 		print("Caption")
 		print(f'"{candidate.caption}"')
-		if rank != len(candidates):
+		if rank != len(visible_candidates):
 			print("------------------------------------------------------")
 	print("======================================================")
-	logging.info("Done.")
+
+
+def _prompt_query() -> str:
+	"""Read a raw query from stdin."""
+	try:
+		return input("Enter query: ")
+	except EOFError:
+		return ""
+
+
+def main() -> None:
+	"""Prompt for a query, run semantic retrieval, and print the top results."""
+	setup_logging()
+	args = parse_args()
+	client: Optional[QdrantClient] = None
+
+	try:
+		raw_query = args.query if args.query is not None else _prompt_query()
+		query_document = parse_query(
+			raw_query,
+			model_name=args.model_name,
+			device=args.device,
+		)
+
+		# Rerank hook goes here later.
+		candidates = retrieve(
+			query_document=query_document,
+			top_k=args.top_k,
+			model_name=args.model_name,
+			qdrant_path=args.qdrant_path,
+			collection_name=args.collection_name,
+			device=args.device,
+		)
+
+		display_candidates(candidates, top_n=DEFAULT_DISPLAY_TOP_K)
+		logging.info("Done.")
+	finally:
+		close_qdrant(args.qdrant_path)
 
 
 if __name__ == "__main__":

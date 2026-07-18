@@ -626,6 +626,40 @@ def validate_query_document(raw_query: str, embedding_text: str, response_text: 
 	return document
 
 
+def parse_query(
+	raw_query: str,
+	model_name: str = DEFAULT_MODEL_NAME,
+	device: str = "auto",
+	max_retries: int = DEFAULT_MAX_RETRIES,
+	max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+	num_beams: int = DEFAULT_NUM_BEAMS,
+) -> QueryDocument:
+	"""Parse a raw natural-language query into a validated QueryDocument."""
+	normalized_query = normalize_query(raw_query)
+	if not normalized_query:
+		return QueryDocument(
+			raw_query=raw_query,
+			scene=None,
+			style=None,
+			pose=None,
+			objects=[],
+			garments=[],
+			embedding_text=normalized_query,
+		)
+
+	tokenizer, model, resolved_device = load_model(model_name, detect_device(device))
+	response_text = generate_json(
+		tokenizer=tokenizer,
+		model=model,
+		device=resolved_device,
+		normalized_query=normalized_query,
+		max_new_tokens=max_new_tokens,
+		num_beams=num_beams,
+		max_retries=max_retries,
+	)
+	return validate_query_document(raw_query=raw_query, embedding_text=normalized_query, response_text=response_text)
+
+
 def _read_query(args: argparse.Namespace) -> str:
 	"""Read the query either from CLI or from stdin."""
 	if args.query is not None:
