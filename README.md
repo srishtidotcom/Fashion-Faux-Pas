@@ -1,182 +1,295 @@
 # Fashion-Faux-Pas
 
-Fashion-aware, composition-correct multimodal image retrieval.
+Multimodal fashion image retrieval from natural language queries.
 
-> Given a natural language query like *"a red tie and a white shirt in a formal setting"*, return images where the colors are bound to the **correct** garments — not just images where those words appear somewhere.
+This repository implements an offline indexing workflow and an online retrieval workflow for a small fashion dataset. The core idea is to improve attribute binding in queries such as "a red tie and a white shirt in a formal setting" without relying on filename matching or a learned reranker. The implementation combines dense captions, structured attribute extraction, FashionCLIP embeddings, Qdrant storage, and a deterministic reranker.
 
-Vanilla CLIP retrieval gets the vocabulary right and the binding wrong. This repo is the fix.
+The system is designed to handle two kinds of queries:
 
----
+- attribute-heavy queries, where the exact garment-color binding matters
+- style-heavy queries, where semantic similarity carries more of the signal
 
-## Why this exists
+## Motivation
 
-Global image/text embeddings (CLIP, FashionCLIP-alone, etc.) collapse a scene into a single vector. That's fine for "dog on a beach," and it's *not* fine for fashion, because fashion queries are compositional: `garment → attribute` pairs matter, and a single vector has no notion of which color modifies which object. Two images — *white shirt / red tie* and *red shirt / white tie* — can sit almost on top of each other in CLIP space. A retrieval system judged on compositional queries will fail silently and confidently.
+Global image/text embeddings are a strong baseline for zero-shot retrieval, but they are weak at compositional binding. In fashion search, that matters because the query often specifies which attribute belongs to which garment. A single embedding can recognize the words in a query and still rank the wrong image above the right one.
 
-At the same time, some queries carry **no explicit attributes at all** (*"casual weekend outfit for a city walk"*) and can only be solved by a model that generalizes zero-shot from a style concept to the garments it implies. That rules out a purely structured/attribute-only system too.
+This repository addresses that by separating the problem into two stages:
 
-Fashion-Faux-Pas is built around **not picking one** — it combines a domain-tuned embedding (for zero-shot generalization) with an LLM-parsed structured attribute schema (for binding correctness), and reranks one against the other.
+1. semantic recall with FashionCLIP and Qdrant
+2. deterministic reranking with structured query/image attributes
 
-Full design rationale, alternatives considered, and evaluation methodology are in the design document submitted alongside this repo (not yet checked in here — add it under e.g. `docs/design_document.pdf` if you want it version-controlled alongside the code).
+The goal is not to claim perfect compositional understanding. The goal is to make the failure mode easier to reduce and easier to measure.
 
----
+## System Architecture
 
-## Architecture
+```mermaid
+flowchart TD
+    A[Raw images in data/raw/images] --> B[scripts/rename_images.py]
+    B --> C[indexing/caption_images.py]
+    C --> D[indexing/parse_caption.py]
+    D --> E[indexing/build_document.py]
+    E --> F[indexing/extract_embedding.py]
+    F --> G[indexing/index_qdrant.py]
 
-Two independent pipelines, one shared schema — an offline indexer and an online retriever.
+    H[Natural-language query] --> I[retrieval/parse_query.py]
+    I --> J[retrieval/retrieve.py]
+    J --> K[retrieval/rerank.py]
+    K --> L[Top-K results]
 
-```
-                    OFFLINE — INDEXER (batch, once per image)
-                    ─────────────────────────────────────────
-                    Raw image
-                         │
-                         ▼
-                    Florence-2  ──▶  dense caption
-                         │
-                         ▼
-                    LLM attribute parser (strict JSON schema)
-                    {scene, style, pose, objects[], garments:[{type, color}]}
-                         │
-                         ▼
-                    FashionCLIP image encoder  ──▶  768-d vector
-                         │
-                         ▼
-                    Qdrant upsert: vector + attribute payload (one point)
-
-
-                    ONLINE — RETRIEVER (per query, low latency)
-                    ─────────────────────────────────────────
-                    User query (natural language)
-                         │
-                         ▼
-                    LLM query parser (same JSON schema)
-                         │
-                         ├──▶ FashionCLIP text encoder ──▶ query vector
-                         │
-                         ▼
-                    Stage 1 — Qdrant ANN (HNSW) recall  ──▶  top-500 candidates
-                         │
-                         ▼
-                    Stage 2 — hybrid rerank
-                    score = α · cosine_similarity + β · attribute_overlap
-                         │
-                         ▼
-                    Top-k images
+    E --> M[scripts/build_evaluation_dataset.py]
+    G --> N[retrieval/evaluate.py]
+    M --> N
 ```
 
-Why this shape, briefly (see the design doc for the full comparison table of alternatives — vanilla CLIP, FashionCLIP-alone, caption-then-embed, and grounded detection):
+The offline pipeline produces one canonical record per image. The online pipeline parses a user query into the same schema, retrieves candidates by semantic similarity, and reranks them with attribute overlap.
 
-| Component | Choice | Because |
+## Repository Structure
+
+| Path | Purpose |
+|---|---|
+| `indexing/` | Caption generation, attribute parsing, document building, image embedding, and Qdrant indexing |
+| `retrieval/` | Query parsing, semantic retrieval, deterministic reranking, and evaluation |
+| `scripts/` | Image renaming and evaluation dataset generation |
+| `data/raw/images/` | Input image directory |
+| `data/processed/` | Intermediate JSON and NumPy artifacts |
+| `data/qdrant_db/` | Local persistent Qdrant storage |
+| `configs/` | Present, but no tracked config files yet |
+
+## Dataset Preparation Pipeline
+
+The checked-in dataset contains 512 fashion images. The scripts assume the images live under `data/raw/images/` and are normalized to sequential filenames before indexing.
+
+### Data artifacts
+
+| Artifact | Description | Produced by |
 |---|---|---|
-| Captioner | Florence-2 | Denser, more literal captions on multi-garment scenes than BLIP-2; better input for the JSON parser |
-| Attribute extraction | LLM, constrained to a fixed JSON schema, validated before indexing | Manufactures `garment → color` binding without training or running a detector; schema validation stops corrupt payloads reaching the index |
-| Embedding backbone | FashionCLIP | Same interface as CLIP, better fashion vocabulary, zero added architectural cost |
-| Vector store | Qdrant | Vector + structured payload on one point (no join, no second DB); native HNSW; native payload filtering, which the geo/weather extension needs |
-| Ranking | Two-stage: cheap ANN recall → bounded hybrid rerank | Keeps the expensive, informative signal (attribute overlap) off the full corpus — this is what keeps the design scalable to 1M images without touching the ranking logic |
+| `captions.json` | Dense captions keyed by filename | `indexing/caption_images.py` |
+| `attributes.json` | Structured attributes extracted from captions | `indexing/parse_caption.py` |
+| `documents.json` | Canonical per-image documents | `indexing/build_document.py` |
+| `embeddings.npy` | FashionCLIP image embedding matrix | `indexing/extract_embedding.py` |
+| `filenames.json` | Filename order aligned with embeddings | `indexing/extract_embedding.py` |
+| `embedding_metadata.json` | Basic embedding-stage metadata | `indexing/extract_embedding.py` |
+| `evaluation_queries.json` | Deterministic query/relevance set | `scripts/build_evaluation_dataset.py` |
+| `evaluation_summary.json` | Aggregate retrieval metrics | `retrieval/evaluate.py` |
 
-Grounded detection (GroundingDINO / OWL-ViT) is the structurally "most correct" fix for compositionality but is disproportionate engineering overhead for a 500–1k image, single-object-class problem. It's flagged as a Phase 2 upgrade — see [Future Work](#future-work).
+### Script reference
 
----
+| Script | Purpose | Input | Output | Dependencies |
+|---|---|---|---|---|
+| `scripts/rename_images.py` | Rename supported images to a sequential numeric scheme | `data/raw/images/*.jpg` | Renamed `.jpg` files such as `000001.jpg` | Python stdlib only |
+| `indexing/caption_images.py` | Generate dense captions with Florence-2 | Raw images | `data/processed/captions.json` | `Pillow`, `torch`, `transformers`, `tqdm` |
+| `indexing/parse_caption.py` | Convert captions into structured attributes with Qwen2.5 | `captions.json` | `attributes.json` | `torch`, `pydantic`, `transformers`, `tqdm` |
+| `indexing/build_document.py` | Merge captions and attributes into canonical image documents | `captions.json`, `attributes.json` | `documents.json` | Python stdlib, `tqdm` |
+| `indexing/extract_embedding.py` | Compute one FashionCLIP image embedding per image | Raw images | `embeddings.npy`, `filenames.json`, `embedding_metadata.json` | `numpy`, `Pillow`, `torch`, `transformers`, `tqdm` |
+| `indexing/extract_embeddings.py` | Compatibility wrapper for the embedding stage | Same as `indexing/extract_embedding.py` | Same as `indexing/extract_embedding.py` | Same as `indexing/extract_embedding.py` |
+| `indexing/index_qdrant.py` | Validate alignment and index documents into local Qdrant | `documents.json`, `embeddings.npy`, `filenames.json` | Local collection under `data/qdrant_db/` | `numpy`, `qdrant-client`, `tqdm` |
+| `retrieval/parse_query.py` | Parse a free-form query into the shared schema | Natural-language query string | `QueryDocument` JSON on stdout | `torch`, `pydantic`, `transformers` |
+| `retrieval/retrieve.py` | Embed the query and run ANN search in Qdrant | Query text or stdin prompt | Semantic candidate list on stdout | `numpy`, `torch`, `qdrant-client`, `transformers` |
+| `retrieval/rerank.py` | Combine semantic similarity and structured attribute overlap | `QueryDocument`, semantic candidates | Reranked candidate list in memory | `QueryDocument` and `RetrievedCandidate` models |
+| `retrieval/evaluate.py` | Compare semantic vs. hybrid ranking on the generated evaluation set | `evaluation_queries.json`, `documents.json` | `evaluation_summary.json` and printed metrics | `torch`, `numpy`, `json`, `math`, shared retrieval modules |
+| `scripts/build_evaluation_dataset.py` | Build a deterministic evaluation dataset from indexed metadata | `documents.json` | `evaluation_queries.json` | Python stdlib |
 
-## Setup
+## Indexing Pipeline
+
+### 1. Rename images
+
+`python scripts/rename_images.py`
+
+This script only handles `.jpg` files in `data/raw/images/`. It renames them to a sequential scheme and uses a temporary rename pass first to avoid collisions.
+
+### 2. Generate dense captions
+
+`python indexing/caption_images.py --input-dir data/raw/images --output-file data/processed/captions.json`
+
+This stage uses Florence-2 to produce dense captions for each image. The output is a filename-to-caption JSON map.
+
+### 3. Parse captions into structured attributes
+
+`python indexing/parse_caption.py --input-file data/processed/captions.json --output-file data/processed/attributes.json`
+
+This stage uses Qwen2.5 to extract a fixed schema from each caption:
+
+| Field | Type |
+|---|---|
+| `scene` | Optional string |
+| `style` | Optional string |
+| `pose` | Optional string |
+| `objects` | List of strings |
+| `garments` | List of `{type, color, pattern}` objects |
+
+The parser validates the model output and retries invalid responses up to the configured retry limit.
+
+### 4. Build canonical documents
+
+`python indexing/build_document.py --captions-file data/processed/captions.json --attributes-file data/processed/attributes.json --output-file data/processed/documents.json`
+
+This stage merges captions and attributes into one canonical document per image. The resulting schema is also used by the query parser so the retrieval code can compare structured fields directly.
+
+### 5. Extract image embeddings
+
+`python indexing/extract_embedding.py --input-dir data/raw/images --embeddings-file data/processed/embeddings.npy --filenames-file data/processed/filenames.json --metadata-file data/processed/embedding_metadata.json`
+
+This stage computes one FashionCLIP image embedding per image and stores the aligned embedding matrix, filename order, and metadata file. The wrapper `indexing/extract_embeddings.py` calls the same entry point.
+
+### 6. Index into Qdrant
+
+`python indexing/index_qdrant.py --documents-file data/processed/documents.json --embeddings-file data/processed/embeddings.npy --filenames-file data/processed/filenames.json --qdrant-path data/qdrant_db --collection-name fashion_images`
+
+This stage validates that the documents, filenames, and embeddings are aligned before upserting them into a local persistent Qdrant collection. The default collection name is `fashion_images`.
+
+## Retrieval Pipeline
+
+### 7. Parse a query
+
+`python retrieval/parse_query.py --query "a red tie and a white shirt in a formal setting"`
+
+The query parser turns a free-form string into a validated `QueryDocument` with the same fields used on the indexing side. When the parser cannot extract structured fields, it still preserves the normalized query text for semantic embedding.
+
+### 8. Retrieve semantic candidates
+
+`python retrieval/retrieve.py --query "a red tie and a white shirt in a formal setting" --top-k 100`
+
+`retrieval/retrieve.py` embeds the query with FashionCLIP, performs ANN search against the local Qdrant collection, and returns typed candidate objects that include the stored payload and the vector score.
+
+### 9. Rerank candidates
+
+The reranker computes structured attribute scores for each semantic candidate and blends them with the vector score:
+
+$$
+\text{score}(q, d) = \alpha \cdot \text{semantic}(q, d) + \beta \cdot \text{attribute}(q, d)
+$$
+
+with default weights:
+
+| Parameter | Default |
+|---|---:|
+| `alpha` | 0.75 |
+| `beta` | 0.25 |
+
+The attribute score is the mean of the available component scores. A missing field is ignored instead of being treated as a mismatch:
+
+$$
+\text{attribute}(q, d) = \frac{1}{|S|} \sum_{s \in S} s(q, d)
+$$
+
+where `S` is the set of query fields that are present.
+
+| Component | Rule |
+|---|---|
+| Garment | Greedy one-to-one match over query garments and candidate garments; garment type must match, and color/pattern must match when both are present |
+| Scene | Exact normalized equality |
+| Style | Exact normalized equality |
+| Pose | Exact normalized equality |
+| Objects | Jaccard similarity between normalized object lists |
+
+The reranker is deterministic. It does not train a model and it does not sample.
+
+### 10. Evaluate retrieval quality
+
+`python retrieval/evaluate.py --dataset-file data/processed/evaluation_queries.json --documents-file data/processed/documents.json --output-file data/processed/evaluation_summary.json --top-k 100 --alpha 0.75 --beta 0.25`
+
+The evaluation script loads the generated dataset, runs semantic retrieval, reranks the candidates, and reports aggregate metrics for both ranking variants.
+
+## Evaluation Methodology
+
+The evaluation dataset is generated from `documents.json` by exact normalized matching. It is deterministic and category-balanced. The default distribution is:
+
+| Category | Count |
+|---|---:|
+| Garment | 20 |
+| Scene | 15 |
+| Style | 15 |
+| Object | 10 |
+| Multi-attribute | 40 |
+
+This makes the evaluation useful for regression checks, but it is not a substitute for a manually labeled benchmark.
+
+### Metrics
+
+| Metric | Meaning |
+|---|---|
+| Hit@1 | At least one relevant item in the top 1 |
+| Hit@5 | At least one relevant item in the top 5 |
+| Hit@10 | At least one relevant item in the top 10 |
+| Precision@5 | Fraction of the top 5 that are relevant |
+| Recall@5 | Fraction of relevant items found in the top 5 |
+| MRR | Reciprocal rank of the first relevant item |
+| nDCG@5 | Normalized discounted cumulative gain at 5 |
+| Precision@10 | Fraction of the top 10 that are relevant |
+| Recall@10 | Fraction of relevant items found in the top 10 |
+| nDCG@10 | Normalized discounted cumulative gain at 10 |
+
+### Results
+
+| Metric | Semantic retrieval | Hybrid retrieval |
+|---|---:|---:|
+| Hit@1 | 0.23 | 0.37 |
+| Hit@5 | 0.56 | 0.56 |
+| Hit@10 | 0.69 | 0.68 |
+| Precision@5 | 0.18 | 0.29 |
+| Recall@5 | 0.15 | 0.22 |
+| MRR | 0.38 | 0.46 |
+| nDCG@5 | 0.22 | 0.34 |
+| Precision@10 | 0.15 | 0.23 |
+| Recall@10 | 0.23 | 0.31 |
+| nDCG@10 | 0.22 | 0.34 |
+
+### Observed change
+
+| Metric | Relative change |
+|---|---:|
+| Hit@1 | +60.9% |
+| Precision@5 | +58.7% |
+| Recall@5 | +48.8% |
+| MRR | +23.0% |
+| nDCG@5 | +59.2% |
+
+The main improvement is in early ranking. Hit@10 is nearly unchanged, which is consistent with a reranker that mostly changes ordering inside the candidate set rather than recall.
+
+## Example Qualitative Retrieval Improvements
+
+The examples below describe the kind of behavior the hybrid reranker is intended to improve.
+
+| Query pattern | Semantic retrieval behavior | Hybrid reranking behavior |
+|---|---|---|
+| Compositional garment-color queries | Can retrieve images that match the words but not the binding | Promotes images where garment-color pairs align with the query |
+| Scene plus garment queries | Can over-weight background scene words | Uses structured fields to separate similar images |
+| Style-heavy queries | Often already performs reasonably well | Usually stays close to semantic retrieval because the structured signal is weaker |
+| Multi-attribute queries | Can rank partially matching images too highly | Moves more fully matched candidates ahead |
+
+## Installation
+
+Create a virtual environment and install the Python dependencies:
 
 ```bash
-git clone https://github.com/<you>/fashion-faux-pas.git
-cd fashion-faux-pas
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-You'll need:
-- Qdrant running with local persistence (this repo uses `data/qdrant_db` as on-disk storage, not a separate server process — see `index_qdrant.py` for the client init)
-- API access for the LLM used in caption parsing
-- ~500–1,000 fashion images in `data/raw/`, with variation across environment (office / street / park / home), clothing type (formal / casual / outerwear), and color
+`requirements.txt` currently lists `requests`, `Pillow`, `transformers`, `torch`, and `tqdm`. The scripts also import `numpy`, `pydantic`, and `qdrant-client`, so those packages must be available in the environment before running the indexing or retrieval scripts.
 
-If you don't have a dataset on hand, sample from [Fashionpedia](https://fashionpedia.github.io/home/) or pull permissively-licensed lifestyle photography from the Pexels/Unsplash APIs.
+The code loads Hugging Face models at runtime, so the first run will download weights for Florence-2, Qwen2.5, and FashionCLIP.
 
----
+## Future Improvements
 
-## Usage
+| Area | Possible next step |
+|---|---|
+| Query quality | Add a manually labeled evaluation set instead of relying only on exact matching |
+| Attribute extraction | Audit parser failure cases for missed garments, wrong colors, or missing scenes |
+| Reranking | Tune `alpha` and `beta` on held-out data rather than keeping the defaults |
+| Structured metadata | Extend the schema with weather and location cues if the dataset supports it |
+| Configuration | Add versioned config files under `configs/` for repeatable experiments |
+| Retrieval scale | Add caching and batch evaluation helpers for larger collections |
 
-### 1. Prepare raw images
+## Limitations
 
-```bash
-python scripts/rename_images.py --input data/raw
-```
+- The dataset is small, so the reported metrics should be read as local evaluation results rather than general conclusions.
+- The evaluation dataset is generated from indexed metadata with exact matching, so it is useful for regression checks but not a substitute for manual labeling.
+- The reranker only uses fields that the parser emits. If the parser misses a garment or assigns the wrong color, the hybrid score cannot recover that error.
+- `configs/` is present but currently empty.
+- Grounded detection is not part of the repository.
 
-Normalizes filenames (e.g. `000001.jpg`, `000002.jpg`, ...) so every downstream stage can join on filename cleanly.
+## License
 
-### 2. Index the dataset (offline, run once)
-
-```bash
-python indexing/caption_images.py    --images data/raw --out data/processed/captions.json
-python indexing/parse_caption.py     --captions data/processed/captions.json --out data/processed/attributes.json
-python indexing/build_document.py    --captions data/processed/captions.json --attributes data/processed/attributes.json --out data/processed/documents.json
-python indexing/extract_embeddings.py --images data/raw --out data/processed/embeddings.npy
-python indexing/index_qdrant.py      --documents data/processed/documents.json --embeddings data/processed/embeddings.npy --collection fashion_images
-```
-
-`extract_embedding.py` (singular) is the single-image variant used for debugging one file at a time — not part of the batch run.
-
-Use `qdrant_db_sanity` or `qdrant_db_test_probe` as the `--collection`/storage target when validating changes to the pipeline, so the real `qdrant_db` collection isn't disturbed.
-
-### 3. Query *(retrieval pipeline — in progress)*
-
-The query-side pipeline is being built out in `retrieval/`. The intended interface:
-
-```bash
-python retrieval/retrieve.py --query "a red tie and a white shirt in a formal setting" --top_k 5
-```
-
-This will run: query parsing (same schema as indexing) → FashionCLIP text embedding → Qdrant ANN recall (top-500) → hybrid rerank (`score = α·cosine_similarity + β·attribute_overlap`) → top-k.
-
-### 4. Evaluate against the baseline
-
-Planned: a `queries.json` covering the five evaluation categories (attribute-specific, contextual/place, complex semantic, style inference, compositional) and an `evaluate.py` reporting Precision@5, Recall@5, and MRR for **FashionCLIP-only** retrieval vs. the **hybrid reranked** pipeline — the comparison that actually answers "did this beat vanilla CLIP," not just "does it return images."
-
----
-
-## How it behaves on the five evaluation query types
-
-| Query type | What resolves it | What breaks without it |
-|---|---|---|
-| Attribute-specific ("bright yellow raincoat") | Attribute overlap on `garment.type=raincoat, garment.color=yellow` | CLIP conflates "yellow" with any yellow object in frame |
-| Contextual/place ("business attire in a modern office") | `scene=office` + `style=business`, reinforced by embedding similarity | Scene tokens can leak from background objects rather than the person's attire |
-| Complex semantic ("blue shirt on a park bench") | Joint match across garment + scene + pose — no single field suffices | Embedding-only retrieval can return "blue jeans in a park" or "shirt on an office bench" |
-| Style inference ("casual weekend outfit for a city walk") | FashionCLIP zero-shot embedding — nothing to parse | The one case where leaning on structured attributes actively hurts |
-| Compositional ("red tie, white shirt, formal") | Attribute overlap with correct garment→color binding | The documented CLIP failure mode this whole reranker exists to fix |
-
----
-
-## Scalability
-
-The design is built so scale only touches Stage 1 (ANN recall) — never the rerank stage or the indexing pipeline, both of which are already per-item and embarrassingly parallel.
-
-- **Indexing**: captioning, parsing, and embedding are independent per image and batch/parallelize trivially — 1M images is a compute-cost question, not an architecture question.
-- **ANN recall**: Qdrant's HNSW index has near-logarithmic query cost; a tuned index (`m`, `ef_construct`, `ef_search`) keeps top-500 recall in low tens of milliseconds at 1M × 768-d. Quantization (scalar/PQ) is available if memory becomes a constraint.
-- **Rerank stays cheap by construction**: it only ever scores the top-500 candidates from Stage 1, regardless of corpus size.
-- **Horizontal scaling**: Qdrant supports native sharding/replication if a single node's memory or QPS budget is exceeded — an infra change, not a retrieval-logic change.
-
-## Zero-shot capability
-
-Two complementary mechanisms cover two different failure modes:
-- **Unseen style/vibe** ("beach-ready look") has no schema field to parse into — retrieval falls back almost entirely on FashionCLIP's pretrained embedding space.
-- **Unseen but explicit attribute combinations** ("mustard corduroy jacket") are handled by the LLM parser doing open-vocabulary extraction — there's no closed label space to fall outside of.
-
-The α/β blend isn't only a precision knob — when `attribute_overlap` is near zero because nothing parsed cleanly, the embedding term carries the ranking on its own, so the system degrades gracefully rather than failing on out-of-schema queries.
-
----
-
-## Future work
-
-**Locations and weather** (additive, not a redesign):
-- Add two payload fields at indexing time — `geo_context` (visual cues: architecture, signage, foliage, or EXIF/GPS where available) and `weather_context` (wet pavement, coats, snow, overcast light).
-- Extend the same LLM parsing prompt with both fields; Florence-2 captions already tend to surface this detail, so the parser can lift it directly.
-- Fold both fields into the existing `attribute_overlap` term — the rerank formula doesn't change shape, only its input schema.
-- Qdrant's native payload filtering can pre-filter by geo/weather before the ANN stage when a query is unambiguous ("in Tokyo"), improving precision and shrinking what the reranker has to score.
-
-**Precision**:
-- Grid-search α/β against a held-out, human-labeled query→relevant-image set (Precision@5, Recall@5, MRR — not estimated).
-- Audit the attribute parser directly: since the whole compositionality fix rests on caption→JSON accuracy, sampling parser output for missed garments or mis-bound colors is likely higher-leverage than swapping any single model.
-- Use parser/embedding disagreement as a trigger to route the disputed subset through grounded detection (Approach D) as a Phase 2 attribute source — keeping the expensive detector off the common case.
-
----
+TODO: add license information.
