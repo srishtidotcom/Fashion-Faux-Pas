@@ -290,6 +290,3 @@ The code loads Hugging Face models at runtime, so the first run will download we
 - `configs/` is present but currently empty.
 - Grounded detection is not part of the repository.
 
-## License
-
-TODO: add license information.
